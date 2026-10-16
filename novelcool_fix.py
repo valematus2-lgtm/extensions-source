@@ -13,6 +13,9 @@ GRADLE = BASE / 'build.gradle.kts'
 
 replacement = r'''    override suspend fun getPageList(chapter: SChapter): List<Page> {
         val chapterUrl = getChapterUrl(chapter)
+        if (chapter.url.startsWith("/go/rds/")) {
+            error("NovelCool Fix: chapter link was saved without its redirect host. Refresh chapters from the NovelCool source and reopen a newly listed chapter.")
+        }
         val browserHeaders = headers.newBuilder()
             .set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
             .set("Referer", "$baseUrl/")
@@ -32,7 +35,7 @@ replacement = r'''    override suspend fun getPageList(chapter: SChapter): List<
 
         var lastDiagnostic = "No requests completed"
         for (url in candidateUrls.distinct()) {
-            val attempt = runCatching { client.get(url, browserHeaders) }
+            val attempt = runCatching { pageClient.get(url, browserHeaders) }
             val response = attempt.getOrNull()
             if (response == null) {
                 lastDiagnostic = "Request failed for ${url.substringBefore('?')}: ${attempt.exceptionOrNull()?.message}"
@@ -105,7 +108,7 @@ replacement = r'''    override suspend fun getPageList(chapter: SChapter): List<
             .set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
             .set("Referer", "$baseUrl/")
             .build()
-        val doc = client.get(page.url, requestHeaders).asJsoup()
+        val doc = pageClient.get(page.url, requestHeaders).asJsoup()
         val image = doc.selectFirst("img.mangaread-manga-pic")
             ?: error("NovelCool Fix: page image missing at ${page.url.substringBefore('?')}; title=${doc.title()}")
         return listOf("data-src", "lazy_url", "src")
@@ -115,11 +118,45 @@ replacement = r'''    override suspend fun getPageList(chapter: SChapter): List<
     }
 
 '''
-# We deliberately replace the whole original reader, but leave the rest of the
-# upstream extension intact (search, list, metadata, language, source IDs).
 if not SOURCE.is_file() or not GRADLE.is_file():
     raise SystemExit('Open the root of the keiyoushi/extensions-source fork first.')
 source = SOURCE.read_text(encoding='utf-8')
+
+# Fix source chapter link parsing. Some NovelCool chapter anchors point to
+# third-party /go/rds/?data=... redirects. setUrlWithoutDomain() destroys the
+# original host, resulting in requests to es.novelcool.com/go/rds/.
+chapter_start = '        val chapterList = document.select(".chapter-item-list a").map { element ->'
+chapter_end = '\n\n        return SMangaUpdate(details, chapterList)'
+chapter_replacement = r'''        val chapterList = document.select(".chapter-item-list a[href]").map { element ->
+            SChapter.create().apply {
+                val link = element.attr("abs:href")
+                val linkHost = runCatching { link.toHttpUrl().host }.getOrNull()
+                // Keep redirects' original host and all query parameters.
+                if (linkHost != null && linkHost != baseUrl.toHttpUrl().host) {
+                    url = link
+                } else {
+                    setUrlWithoutDomain(link)
+                }
+                name = element.attr("title")
+                date_upload = DATE_FORMATTER.tryParseDate(element.select(".chapter-item-time").text())
+            }
+        }'''
+if chapter_start not in source or chapter_end not in source:
+    raise SystemExit('Unexpected chapter selector; refusing to patch.')
+chap_start = source.index(chapter_start)
+chap_end = source.index(chapter_end, chap_start)
+source = source[:chap_start] + chapter_replacement + source[chap_end:]
+
+chapter_url_override = r'''    override fun getChapterUrl(chapter: SChapter): String =
+        if (chapter.url.startsWith("https://") || chapter.url.startsWith("http://")) chapter.url
+        else "$baseUrl${chapter.url}"
+
+'''
+chapter_marker = '    override suspend fun getPageList(chapter: SChapter): List<Page> {'
+if source.count(chapter_marker) != 1:
+    raise SystemExit('Unexpected chapter URL function; refusing to patch.')
+source = source.replace(chapter_marker, chapter_url_override + chapter_marker, 1)
+
 start_marker = '    override suspend fun getPageList(chapter: SChapter): List<Page> {'
 end_marker = '    private fun Elements.imgAttr(): String = when {'
 if source.count(start_marker) != 1 or source.count(end_marker) != 1:
@@ -130,9 +167,9 @@ updated = source[:start] + replacement + source[end:]
 
 # Increase extension version so Tachimanga sees this as newer than 1.6.2.
 gradle = GRADLE.read_text(encoding='utf-8')
-new_gradle, count = re.subn(r'\bversionCode\s*=\s*1\b', 'versionCode = 3', gradle)
+new_gradle, count = re.subn(r'\bversionCode\s*=\s*1\b', 'versionCode = 4', gradle)
 if count != 1:
     raise SystemExit('Unexpected NovelCool versionCode; not patching.')
 SOURCE.write_text(updated, encoding='utf-8')
 GRADLE.write_text(new_gradle, encoding='utf-8')
-print('Patched NovelCool version 1.6.3 with chapter parser and diagnostics.')
+print('Patched NovelCool 1.6.4 with preserved chapter URLs, reader and diagnostics.')
