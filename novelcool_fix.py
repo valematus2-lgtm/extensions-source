@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Experimental NovelCool 1.6.1 parser fix for keiyoushi/extensions-source.
+"""Patch Keiyoushi NovelCool to handle page-by-page HTML and show useful errors.
 
-Run from the repository root; modifies only NovelCool.kt and build.gradle.kts.
-Does NOT produce a working JAR by itself.
+Run from the root of a freshly checked out keiyoushi/extensions-source fork.
+Requires no pip dependencies.
 """
 from pathlib import Path
 import re
@@ -12,96 +12,127 @@ SOURCE = BASE / 'src/eu/kanade/tachiyomi/extension/all/novelcool/NovelCool.kt'
 GRADLE = BASE / 'build.gradle.kts'
 
 replacement = r'''    override suspend fun getPageList(chapter: SChapter): List<Page> {
-        var doc = pageClient.get(getChapterUrl(chapter)).asJsoup()
+        val chapterUrl = getChapterUrl(chapter)
+        val browserHeaders = headers.newBuilder()
+            .set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+            .set("Referer", "$baseUrl/")
+            .build()
 
-        // Some requests end on an intermediate source-selector page.
-        doc.selectFirst("a.vision-button[href]")?.attr("abs:href")
-            ?.takeIf { it.isNotBlank() }
-            ?.let { target ->
-                val forwardedHeaders = headers.newBuilder()
-                    .set("Referer", doc.baseUri())
-                    .build()
-                doc = pageClient.get(target, forwardedHeaders).asJsoup()
+        // NovelCool supports several chapter address forms. We try the ordinary
+        // address first, followed by its explicit first-page variant.
+        val candidateUrls = mutableListOf(chapterUrl)
+        val withoutQuery = chapterUrl.substringBefore('?')
+        if (withoutQuery.contains("/chapter/")) {
+            val stem = withoutQuery.removeSuffix("/").removeSuffix(".html")
+            if (!stem.endsWith("-1")) {
+                candidateUrls.add("$stem-1.html")
+                candidateUrls.add("$stem-1-1.html")
             }
+        }
 
-        // NovelCool has used both `all_imgs_url: [...]` and `all_imgs_url = [...]`.
-        // Read every script instead of just the first script containing the name.
+        var lastDiagnostic = "No requests completed"
+        for (url in candidateUrls.distinct()) {
+            val attempt = runCatching { client.get(url, browserHeaders) }
+            val response = attempt.getOrNull()
+            if (response == null) {
+                lastDiagnostic = "Request failed for ${url.substringBefore('?')}: ${attempt.exceptionOrNull()?.message}"
+                continue
+            }
+            var doc = response.asJsoup()
+            parseChapterPages(doc)?.let { return it }
+
+            // Some requests are sent to an intermediate source-selection page.
+            // Only try this route if the actual chapter was not served directly.
+            val serverUrl = doc.selectFirst("a.vision-button[href]")?.attr("abs:href")
+            if (!serverUrl.isNullOrBlank()) {
+                doc = runCatching {
+                    val nextHeaders = browserHeaders.newBuilder()
+                        .set("Referer", doc.baseUri())
+                        .build()
+                    pageClient.get(serverUrl, nextHeaders).asJsoup()
+                }.getOrElse { doc }
+                parseChapterPages(doc)?.let { return it }
+            }
+            lastDiagnostic = "requested=${url.substringBefore('?')}, " +
+                "landed=${doc.baseUri().substringBefore('?')}, " +
+                "title=${doc.title().take(60)}, " +
+                "pageOptions=${doc.select("select.sl-page option").size}, " +
+                "images=${doc.select("img.mangaread-manga-pic").size}"
+        }
+        error("NovelCool Fix: no pages. $lastDiagnostic")
+    }
+
+    private fun parseChapterPages(doc: Document): List<Page>? {
+        // Layout A: one JS array containing every image URL.
         val scripts = doc.select("script").joinToString("\n") { it.data() }
             .replace("\\/", "/")
-        val imageArray = Regex("""all_imgs_url[\"']?\s*[:=]\s*\[([\s\S]*?)]""")
+        val imageArray = Regex("""all_imgs_url["']?\s*[:=]\s*\[([\s\S]*?)]""")
             .find(scripts)?.groupValues?.get(1)
         if (imageArray != null) {
             val urls = imageUrlRegex.findAll(imageArray)
-                .map { it.groupValues[1] }
-                .distinct()
-                .toList()
-            if (urls.isNotEmpty()) {
-                return urls.mapIndexed { index, url -> Page(index, imageUrl = url) }
-            }
+                .map { it.groupValues[1].replace("\\/", "/") }
+                .distinct().toList()
+            if (urls.isNotEmpty()) return urls.mapIndexed { i, u -> Page(i, imageUrl = u) }
         }
 
-        // Fallback for chapters served as individual pages instead of an array.
-        val pageUrls = doc.select(
-            ".mangaread-pagenav select option[value], " +
-                "select.sl-page option[value], " +
-                "select[id*=page] option[value], select[name*=page] option[value]",
-        ).mapNotNull { option ->
+        // Layout B (verified against The Chain of Youth, chapter 1):
+        // 21 options in <select class="sl-page">, one image per HTML page.
+        val pageSelect = doc.selectFirst("select.sl-page")
+        val pageUrls = pageSelect?.select("option[value]")?.mapNotNull { option ->
             val raw = option.attr("value").trim()
-            if (!(raw.startsWith("/") || raw.startsWith("http") || raw.startsWith("?"))) {
-                null
-            } else {
-                runCatching { doc.baseUri().toHttpUrl().resolve(raw)?.toString() }
-                    .getOrNull()
-                    ?.takeIf { it.contains("/chapter/") }
-            }
-        }.distinct()
+            val resolved = runCatching { doc.baseUri().toHttpUrl().resolve(raw) }.getOrNull()
+            resolved?.toString()?.takeIf { it.contains("/chapter/") }
+        }?.distinct().orEmpty()
         if (pageUrls.isNotEmpty()) {
-            return pageUrls.mapIndexed { index, url -> Page(index, url = url) }
+            return pageUrls.mapIndexed { i, u -> Page(i, url = u) }
         }
 
-        // If the page contains actual comic images directly, at least return them.
-        val images = doc.select(
-            "img.mangaread-manga-pic, #manga-reading img, .mangaread-content img, " +
-                "img[src*=movietop.cc], img[data-src*=movietop.cc]",
-        ).mapNotNull { element ->
-            sequenceOf("data-src", "lazy_url", "src")
-                .map { element.attr("abs:$it") }
-                .firstOrNull { it.startsWith("http") }
-        }.distinct()
-        return images.mapIndexed { index, url -> Page(index, imageUrl = url) }
+        // Layout C: images rendered directly, without a page selector.
+        val directImages = doc.select("#viewer img.mangaread-manga-pic, img.mangaread-manga-pic")
+            .mapNotNull { image ->
+                listOf("data-src", "lazy_url", "src")
+                    .map { image.attr("abs:$it") }
+                    .firstOrNull { it.startsWith("https://") || it.startsWith("http://") }
+            }.distinct()
+        if (directImages.isNotEmpty()) {
+            return directImages.mapIndexed { i, u -> Page(i, imageUrl = u) }
+        }
+        return null
     }
 
     override suspend fun getImageUrl(page: Page): String {
-        val doc = pageClient.get(page.url).asJsoup()
-        return doc.selectFirst(
-            "img.mangaread-manga-pic, #manga-reading img, .mangaread-content img, " +
-                "img[src*=movietop.cc], img[data-src*=movietop.cc]",
-        )?.let { element ->
-            sequenceOf("data-src", "lazy_url", "src")
-                .map { element.attr("abs:$it") }
-                .firstOrNull { it.startsWith("http") }
-        } ?: error("NovelCool: image not found in ${page.url}")
+        val requestHeaders = headers.newBuilder()
+            .set("User-Agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+            .set("Referer", "$baseUrl/")
+            .build()
+        val doc = client.get(page.url, requestHeaders).asJsoup()
+        val image = doc.selectFirst("img.mangaread-manga-pic")
+            ?: error("NovelCool Fix: page image missing at ${page.url.substringBefore('?')}; title=${doc.title()}")
+        return listOf("data-src", "lazy_url", "src")
+            .map { image.attr("abs:$it") }
+            .firstOrNull { it.startsWith("http://") || it.startsWith("https://") }
+            ?: error("NovelCool Fix: image source empty at ${page.url.substringBefore('?')}")
     }
 
 '''
-
+# We deliberately replace the whole original reader, but leave the rest of the
+# upstream extension intact (search, list, metadata, language, source IDs).
 if not SOURCE.is_file() or not GRADLE.is_file():
-    raise SystemExit('Missing NovelCool source. Run this from the keiyoushi/extensions-source root.')
+    raise SystemExit('Open the root of the keiyoushi/extensions-source fork first.')
 source = SOURCE.read_text(encoding='utf-8')
 start_marker = '    override suspend fun getPageList(chapter: SChapter): List<Page> {'
 end_marker = '    private fun Elements.imgAttr(): String = when {'
 if source.count(start_marker) != 1 or source.count(end_marker) != 1:
-    raise SystemExit('Unexpected NovelCool.kt version; aborting safely.')
+    raise SystemExit('Unexpected source: not patching NovelCool.kt.')
 start = source.index(start_marker)
 end = source.index(end_marker, start)
-modified = source[:start] + replacement + source[end:]
-if modified == source:
-    raise SystemExit('Source did not change.')
+updated = source[:start] + replacement + source[end:]
 
+# Increase extension version so Tachimanga sees this as newer than 1.6.2.
 gradle = GRADLE.read_text(encoding='utf-8')
-changed, times = re.subn(r'\bversionCode\s*=\s*1\b', 'versionCode = 2', gradle)
-if times != 1:
-    raise SystemExit('Unexpected build.gradle.kts version; aborting safely.')
-SOURCE.write_text(modified, encoding='utf-8')
-GRADLE.write_text(changed, encoding='utf-8')
-print('NovelCool.kt parser updated; version bumped to 1.6.2 (experimental).')
+new_gradle, count = re.subn(r'\bversionCode\s*=\s*1\b', 'versionCode = 3', gradle)
+if count != 1:
+    raise SystemExit('Unexpected NovelCool versionCode; not patching.')
+SOURCE.write_text(updated, encoding='utf-8')
+GRADLE.write_text(new_gradle, encoding='utf-8')
+print('Patched NovelCool version 1.6.3 with chapter parser and diagnostics.')
